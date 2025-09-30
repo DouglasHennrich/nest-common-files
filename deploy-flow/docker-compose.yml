@@ -1,0 +1,59 @@
+services:
+  # ========= APP NestJS =========
+  app:
+    build:
+      context: ..
+      dockerfile: deploy-flow/Dockerfile
+    container_name: nest-app
+    restart: always
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_USER: ${DATABASE_USER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      DATABASE_DB_NAME: ${DATABASE_DB_NAME}
+      PORT: ${INFRA_PORT:-3100}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "${INFRA_PORT:-3100}"  # Somente acessível por containers na mesma rede
+    networks:
+      - backend-network
+    labels:
+      - "project=nest-app"
+
+  # ========= DATABASE =========
+  db:
+    image: postgres:15
+    container_name: postgres-db
+    restart: always
+    env_file:
+      - ./.env
+    environment:
+      POSTGRES_USER: ${DATABASE_USER}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      POSTGRES_DB: ${DATABASE_DB_NAME}
+    ports:
+      - "${DATABASE_PORT:-5432}:5432"  # opcional, só se quiser acessar remotamente
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend-network
+    labels:
+      - "project=nest-app"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER} -d ${DATABASE_DB_NAME}"]
+      interval: 2s
+      retries: 10
+
+# ========= VOLUMES =========
+volumes:
+  pgdata:
+
+# ========= NETWORKS =========
+networks:
+  backend-network:
+    driver: bridge
