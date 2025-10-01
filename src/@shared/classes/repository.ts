@@ -792,7 +792,30 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
             const sampleData = chunk[0].id
               ? { ...chunk[0].data, id: chunk[0].id }
               : chunk[0].data;
-            const columns = Object.keys(sampleData);
+            const propertyNames = Object.keys(sampleData).sort();
+            const metadata = this.collection.metadata;
+
+            const columnMappings: {
+              propertyName: string;
+              columnName: string;
+            }[] = [];
+
+            propertyNames.forEach((propertyName) => {
+              const column = metadata.findColumnWithPropertyName(propertyName);
+              if (column) {
+                columnMappings.push({
+                  propertyName,
+                  columnName: column.databaseName,
+                });
+              } else {
+                columnMappings.push({
+                  propertyName,
+                  columnName: propertyName,
+                });
+              }
+            });
+
+            const columns = columnMappings.map((mapping) => mapping.columnName);
 
             const valuesClauses: string[] = [];
             const allValues: any[] = [];
@@ -908,7 +931,7 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
 
             if (valuesToInsert.length === 0) continue;
 
-            const propertyNames = Object.keys(valuesToInsert[0]);
+            const propertyNames = Object.keys(valuesToInsert[0]).sort();
             const metadata = this.collection.metadata;
 
             const columnMappings: {
@@ -1388,6 +1411,18 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
       conditions.push(`${columnName} >= $${++currentParamIndex}`);
     }
 
+    // Check if value is a TypeORM FindOperator for IN
+    if (
+      value &&
+      typeof value === 'object' &&
+      '_type' in value &&
+      value._type === 'in'
+    ) {
+      const _val = value._value;
+      const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
+      conditions.push(`${columnName} IN (${placeholders})`);
+    }
+
     if ('$in' in value || 'In' in value) {
       const _val = value.$in || value.In;
       const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
@@ -1460,6 +1495,15 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
    */
   private extractOperatorParameters(value: any): any[] {
     const params: any[] = [];
+
+    // Check if value is a TypeORM FindOperator
+    if (value && typeof value === 'object' && '_type' in value) {
+      if (value._type === 'in' && Array.isArray(value._value)) {
+        params.push(...value._value);
+      }
+      // Add other operator types as needed
+      return params;
+    }
 
     // Check all possible operators
     const operators = [
