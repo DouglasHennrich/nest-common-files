@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 import {
   DataSource,
@@ -443,16 +444,45 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
 
   async hardDelete(id: string | FindOptionsWhere<Entity>): Promise<void> {
     return this.execute(async () => {
-      await this.collection.delete(
-        typeof id === 'string'
-          ? ({
-              id,
-            } as unknown as FindOptionsWhere<Entity>)
-          : id,
-      );
+      await this.dataSource.transaction(async (manager) => {
+        // First, find the entity to get its relations
+        const whereCondition =
+          typeof id === 'string'
+            ? ({ id } as unknown as FindOptionsWhere<Entity>)
+            : id;
 
-      //
+        const entity = await manager.findOne(this.collection.target, {
+          where: whereCondition,
+        });
+
+        if (!entity) {
+          return; // Entity doesn't exist, nothing to delete
+        }
+
+        // Get all SET NULL relationships for this entity
+        const setNullRelations = this.getSetNullRelations();
+
+        // Handle SET NULL relations (update foreign keys to null)
+        for (const setNullRelation of setNullRelations) {
+          await this.handleSetNullRelation(manager, entity, setNullRelation);
+        }
+
+        // Finally, hard delete the main entity
+        await manager.delete(this.collection.target, whereCondition);
+      });
     }, 'hardDelete');
+  }
+
+  /**
+   * Check if an entity has soft delete enabled by verifying if it has a 'deletedAt' column
+   */
+  private hasSoftDeleteEnabled(metadata: any): boolean {
+    return metadata.columns.some((column: any) => {
+      return (
+        column.propertyName === 'deletedAt' ||
+        column.databaseName === 'deleted_at'
+      );
+    });
   }
 
   async softDelete(id: string | FindOptionsWhere<Entity>): Promise<void> {
@@ -472,8 +502,24 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
           return; // Entity doesn't exist, nothing to delete
         }
 
+        // Check if the main entity has soft delete enabled
+        if (!this.hasSoftDeleteEnabled(this.collection.metadata)) {
+          this.logger.warn(
+            `Entity ${this.collection.metadata.tableName} does not have soft delete enabled. Skipping soft delete operation.`,
+          );
+          return; // Skip the operation instead of throwing error
+        }
+
+        // Get all SET NULL relationships for this entity
+        const setNullRelations = this.getSetNullRelations();
+
         // Get all cascade relationships for this entity
         const cascadeRelations = this.getCascadeRelations();
+
+        // First, handle SET NULL relations (update foreign keys to null)
+        for (const setNullRelation of setNullRelations) {
+          await this.handleSetNullRelation(manager, entity, setNullRelation);
+        }
 
         // Recursively soft delete cascade relations first
         for (const relation of cascadeRelations) {
@@ -544,6 +590,102 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
   }
 
   /**
+   * Get all relations that have onDelete: 'SET NULL' configured
+   * This finds entities that reference THIS entity and should be set to null when this entity is deleted
+   */
+  private getSetNullRelations() {
+    const metadata = this.collection.metadata;
+    const setNullRelations: any[] = [];
+
+    // Check OneToOne relations where OTHER entities reference THIS entity with SET NULL
+    metadata.oneToOneRelations.forEach((relation) => {
+      if (relation.onDelete === 'SET NULL') {
+        // This means when THIS entity is deleted, the foreign key in the related entity should be set to null
+        // For OneToOne SET NULL, we need to find the column in the related entity that references this entity
+
+        let foreignKey: string | undefined;
+
+        // Try to get the foreign key from the inverse relation's join columns
+        if (relation.inverseRelation?.joinColumns?.[0]?.propertyName) {
+          foreignKey = relation.inverseRelation.joinColumns[0].propertyName;
+        }
+        // Fallback: try to get from the relation's referenced column
+        else if (
+          relation.inverseRelation?.joinColumns?.[0]?.referencedColumn
+            ?.propertyName
+        ) {
+          foreignKey =
+            relation.inverseRelation.joinColumns[0].referencedColumn
+              .propertyName;
+        }
+        // Last resort: use the relation property name (though this might not be the column name)
+        else {
+          foreignKey = relation.propertyName + 'Id'; // Common convention
+        }
+
+        setNullRelations.push({
+          type: 'OneToOneSetNull',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          foreignKey,
+        });
+      }
+    });
+
+    // Check OneToMany relations where child entities should be set to null (though this is less common)
+    metadata.oneToManyRelations.forEach((relation) => {
+      if (relation.onDelete === 'SET NULL') {
+        // For OneToMany SET NULL, the foreign key is in the child entity
+        let foreignKey: string | undefined;
+
+        // Try to get the foreign key from the inverse relation's join columns
+        if (relation.inverseRelation?.joinColumns?.[0]?.propertyName) {
+          foreignKey = relation.inverseRelation.joinColumns[0].propertyName;
+        }
+        // Fallback: use the relation property name as a convention
+        else {
+          foreignKey = relation.propertyName + 'Id';
+        }
+
+        setNullRelations.push({
+          type: 'OneToManySetNull',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          foreignKey,
+        });
+      }
+    });
+
+    return setNullRelations;
+  }
+
+  /**
+   * Handle SET NULL relations by updating foreign key columns to null
+   * This finds entities that reference the entity being deleted and sets their foreign keys to null
+   */
+  private async handleSetNullRelation(
+    manager: EntityManager,
+    parentEntity: Entity,
+    setNullRelation: any,
+  ): Promise<void> {
+    const { targetEntity, foreignKey } = setNullRelation;
+    const parentId = (parentEntity as any).id;
+
+    // Update all entities that reference this entity by setting their foreign key to null
+    const updateResult = await manager.update(
+      targetEntity,
+      { [foreignKey]: parentId },
+      { [foreignKey]: null },
+    );
+
+    if (updateResult.affected && updateResult.affected > 0) {
+      this.logger.log(
+        `Updated foreign key ${foreignKey} to null in ${updateResult.affected} ${targetEntity.name} records for deleted entity ${this.collection.metadata.tableName} with id ${parentId}`,
+      );
+    }
+  }
+
+  /**
    * Recursively soft delete cascade relations
    */
   private async softDeleteCascadeRelation(
@@ -599,6 +741,14 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
       const relatedRepo = manager.getRepository(targetEntity);
       const relatedMetadata = relatedRepo.metadata;
 
+      // Check if the related entity has soft delete enabled
+      if (!this.hasSoftDeleteEnabled(relatedMetadata)) {
+        this.logger.warn(
+          `Related entity ${relatedMetadata.tableName} does not have soft delete enabled. Skipping cascade soft delete for this entity.`,
+        );
+        continue; // Skip this related entity
+      }
+
       // Check if the related entity has its own cascade relations
       const nestedCascades = this.getCascadeRelationsForEntity(relatedMetadata);
 
@@ -635,6 +785,14 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
     if (relatedEntity) {
       const relatedRepo = manager.getRepository(targetEntity);
       const relatedMetadata = relatedRepo.metadata;
+
+      // Check if the related entity has soft delete enabled
+      if (!this.hasSoftDeleteEnabled(relatedMetadata)) {
+        this.logger.warn(
+          `Related entity ${relatedMetadata.tableName} does not have soft delete enabled. Skipping cascade soft delete for this entity.`,
+        );
+        return; // Skip this related entity
+      }
 
       // Check if the related entity has its own cascade relations
       const nestedCascades = this.getCascadeRelationsForEntity(relatedMetadata);
