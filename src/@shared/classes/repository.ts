@@ -116,7 +116,7 @@ export interface IRepository<Entity extends ObjectLiteral, Model> {
   restoreSoftDeleted(
     id: string | FindOptionsWhere<Entity>,
   ): Promise<Model | undefined>;
-  queryBuilder(alias: string): Promise<SelectQueryBuilder<Entity>>;
+  queryBuilder(alias: string): SelectQueryBuilder<Entity>;
 
   bulkCreate(payload: {
     data: Array<{
@@ -473,18 +473,6 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
     }, 'hardDelete');
   }
 
-  /**
-   * Check if an entity has soft delete enabled by verifying if it has a 'deletedAt' column
-   */
-  private hasSoftDeleteEnabled(metadata: any): boolean {
-    return metadata.columns.some((column: any) => {
-      return (
-        column.propertyName === 'deletedAt' ||
-        column.databaseName === 'deleted_at'
-      );
-    });
-  }
-
   async softDelete(id: string | FindOptionsWhere<Entity>): Promise<void> {
     return this.execute(async () => {
       await this.dataSource.transaction(async (manager) => {
@@ -503,7 +491,7 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
         }
 
         // Check if the main entity has soft delete enabled
-        if (!this.hasSoftDeleteEnabled(this.collection.metadata)) {
+        if (!this.getDeletedAtColumnName()) {
           this.logger.warn(
             `Entity ${this.collection.metadata.tableName} does not have soft delete enabled. Skipping soft delete operation.`,
           );
@@ -532,371 +520,6 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
     }, 'softDelete');
   }
 
-  /**
-   * Get all relations that have onDelete: 'CASCADE' configured
-   */
-  private getCascadeRelations() {
-    const metadata = this.collection.metadata;
-    const cascadeRelations: any[] = [];
-
-    // Check OneToMany relations
-    metadata.oneToManyRelations.forEach((relation) => {
-      if (relation.onDelete === 'CASCADE') {
-        cascadeRelations.push({
-          type: 'OneToMany',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          joinColumn:
-            relation.inverseRelation?.joinColumns?.[0]?.propertyName || 'id',
-          foreignKey:
-            relation.inverseRelation?.joinColumns?.[0]?.referencedColumn
-              ?.propertyName || relation.propertyName,
-        });
-      }
-    });
-
-    // Check OneToOne relations where this entity is the owner
-    metadata.oneToOneRelations.forEach((relation) => {
-      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
-        cascadeRelations.push({
-          type: 'OneToOne',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          joinColumn: relation.joinColumns?.[0]?.propertyName || 'id',
-          foreignKey:
-            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
-        });
-      }
-    });
-
-    // Check ManyToMany relations where this entity owns the junction table
-    metadata.manyToManyRelations.forEach((relation) => {
-      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
-        cascadeRelations.push({
-          type: 'ManyToMany',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          junctionTable: relation.junctionEntityMetadata?.tableName,
-          ownerColumn:
-            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
-          inverseColumn:
-            relation.inverseJoinColumns?.[0]?.referencedColumn?.propertyName ||
-            'id',
-        });
-      }
-    });
-
-    return cascadeRelations;
-  }
-
-  /**
-   * Get all relations that have onDelete: 'SET NULL' configured
-   * This finds entities that reference THIS entity and should be set to null when this entity is deleted
-   */
-  private getSetNullRelations() {
-    const metadata = this.collection.metadata;
-    const setNullRelations: any[] = [];
-
-    // Check OneToOne relations where OTHER entities reference THIS entity with SET NULL
-    metadata.oneToOneRelations.forEach((relation) => {
-      if (relation.onDelete === 'SET NULL') {
-        // This means when THIS entity is deleted, the foreign key in the related entity should be set to null
-        // For OneToOne SET NULL, we need to find the column in the related entity that references this entity
-
-        let foreignKey: string | undefined;
-
-        // Try to get the foreign key from the inverse relation's join columns
-        if (relation.inverseRelation?.joinColumns?.[0]?.propertyName) {
-          foreignKey = relation.inverseRelation.joinColumns[0].propertyName;
-        }
-        // Fallback: try to get from the relation's referenced column
-        else if (
-          relation.inverseRelation?.joinColumns?.[0]?.referencedColumn
-            ?.propertyName
-        ) {
-          foreignKey =
-            relation.inverseRelation.joinColumns[0].referencedColumn
-              .propertyName;
-        }
-        // Last resort: use the relation property name (though this might not be the column name)
-        else {
-          foreignKey = relation.propertyName + 'Id'; // Common convention
-        }
-
-        setNullRelations.push({
-          type: 'OneToOneSetNull',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          foreignKey,
-        });
-      }
-    });
-
-    // Check OneToMany relations where child entities should be set to null (though this is less common)
-    metadata.oneToManyRelations.forEach((relation) => {
-      if (relation.onDelete === 'SET NULL') {
-        // For OneToMany SET NULL, the foreign key is in the child entity
-        let foreignKey: string | undefined;
-
-        // Try to get the foreign key from the inverse relation's join columns
-        if (relation.inverseRelation?.joinColumns?.[0]?.propertyName) {
-          foreignKey = relation.inverseRelation.joinColumns[0].propertyName;
-        }
-        // Fallback: use the relation property name as a convention
-        else {
-          foreignKey = relation.propertyName + 'Id';
-        }
-
-        setNullRelations.push({
-          type: 'OneToManySetNull',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          foreignKey,
-        });
-      }
-    });
-
-    return setNullRelations;
-  }
-
-  /**
-   * Handle SET NULL relations by updating foreign key columns to null
-   * This finds entities that reference the entity being deleted and sets their foreign keys to null
-   */
-  private async handleSetNullRelation(
-    manager: EntityManager,
-    parentEntity: Entity,
-    setNullRelation: any,
-  ): Promise<void> {
-    const { targetEntity, foreignKey } = setNullRelation;
-    const parentId = (parentEntity as any).id;
-
-    // Update all entities that reference this entity by setting their foreign key to null
-    const updateResult = await manager.update(
-      targetEntity,
-      { [foreignKey]: parentId },
-      { [foreignKey]: null },
-    );
-
-    if (updateResult.affected && updateResult.affected > 0) {
-      this.logger.log(
-        `Updated foreign key ${foreignKey} to null in ${updateResult.affected} ${targetEntity.name} records for deleted entity ${this.collection.metadata.tableName} with id ${parentId}`,
-      );
-    }
-  }
-
-  /**
-   * Recursively soft delete cascade relations
-   */
-  private async softDeleteCascadeRelation(
-    manager: EntityManager,
-    parentEntity: Entity,
-    relationConfig: any,
-  ): Promise<void> {
-    const { type } = relationConfig;
-
-    switch (type) {
-      case 'OneToMany':
-        await this.softDeleteOneToManyRelation(
-          manager,
-          parentEntity,
-          relationConfig,
-        );
-        break;
-      case 'OneToOne':
-        await this.softDeleteOneToOneRelation(
-          manager,
-          parentEntity,
-          relationConfig,
-        );
-        break;
-      case 'ManyToMany':
-        await this.softDeleteManyToManyRelation(
-          manager,
-          parentEntity,
-          relationConfig,
-        );
-        break;
-    }
-  }
-
-  /**
-   * Soft delete OneToMany cascade relations
-   */
-  private async softDeleteOneToManyRelation(
-    manager: EntityManager,
-    parentEntity: Entity,
-    relationConfig: any,
-  ): Promise<void> {
-    const { targetEntity, foreignKey } = relationConfig;
-    const parentId = (parentEntity as any).id;
-
-    // Find all related entities
-    const relatedEntities = await manager.find(targetEntity, {
-      where: { [foreignKey]: parentId } as any,
-    });
-
-    // Recursively soft delete each related entity (in case they have their own cascades)
-    for (const relatedEntity of relatedEntities) {
-      const relatedRepo = manager.getRepository(targetEntity);
-      const relatedMetadata = relatedRepo.metadata;
-
-      // Check if the related entity has soft delete enabled
-      if (!this.hasSoftDeleteEnabled(relatedMetadata)) {
-        this.logger.warn(
-          `Related entity ${relatedMetadata.tableName} does not have soft delete enabled. Skipping cascade soft delete for this entity.`,
-        );
-        continue; // Skip this related entity
-      }
-
-      // Check if the related entity has its own cascade relations
-      const nestedCascades = this.getCascadeRelationsForEntity(relatedMetadata);
-
-      for (const nestedCascade of nestedCascades) {
-        await this.softDeleteCascadeRelation(
-          manager,
-          relatedEntity as Entity,
-          nestedCascade,
-        );
-      }
-
-      // Soft delete the related entity
-      await manager.softDelete(targetEntity, { id: (relatedEntity as any).id });
-    }
-  }
-
-  /**
-   * Soft delete OneToOne cascade relations
-   */
-  private async softDeleteOneToOneRelation(
-    manager: EntityManager,
-    parentEntity: Entity,
-    relationConfig: any,
-  ): Promise<void> {
-    const { targetEntity, joinColumn } = relationConfig;
-    const foreignKeyValue = (parentEntity as any)[joinColumn];
-
-    if (!foreignKeyValue) return;
-
-    const relatedEntity = await manager.findOne(targetEntity, {
-      where: { id: foreignKeyValue } as any,
-    });
-
-    if (relatedEntity) {
-      const relatedRepo = manager.getRepository(targetEntity);
-      const relatedMetadata = relatedRepo.metadata;
-
-      // Check if the related entity has soft delete enabled
-      if (!this.hasSoftDeleteEnabled(relatedMetadata)) {
-        this.logger.warn(
-          `Related entity ${relatedMetadata.tableName} does not have soft delete enabled. Skipping cascade soft delete for this entity.`,
-        );
-        return; // Skip this related entity
-      }
-
-      // Check if the related entity has its own cascade relations
-      const nestedCascades = this.getCascadeRelationsForEntity(relatedMetadata);
-
-      for (const nestedCascade of nestedCascades) {
-        await this.softDeleteCascadeRelation(
-          manager,
-          relatedEntity as Entity,
-          nestedCascade,
-        );
-      }
-
-      // Soft delete the related entity
-      await manager.softDelete(targetEntity, { id: (relatedEntity as any).id });
-    }
-  }
-
-  /**
-   * Handle ManyToMany cascade relations (removes junction table entries)
-   */
-  private async softDeleteManyToManyRelation(
-    manager: EntityManager,
-    parentEntity: Entity,
-    relationConfig: any,
-  ): Promise<void> {
-    const { junctionTable, ownerColumn } = relationConfig;
-    const parentId = (parentEntity as any).id;
-
-    if (!junctionTable) return;
-
-    // For ManyToMany, we typically just remove the junction table entries
-    // The related entities themselves are usually not deleted in cascade
-    // But if you need to soft delete them as well, you can implement that logic here
-
-    // Remove junction table entries
-    await manager.query(
-      `DELETE FROM ${junctionTable} WHERE ${ownerColumn} = $1`,
-      [parentId],
-    );
-
-    // If you need to also soft delete the related entities:
-    // const relatedIds = await manager.query(
-    //   `SELECT ${relationConfig.inverseColumn} FROM ${junctionTable} WHERE ${ownerColumn} = $1`,
-    //   [parentId]
-    // );
-    //
-    // for (const { [relationConfig.inverseColumn]: relatedId } of relatedIds) {
-    //   await manager.softDelete(targetEntity, { id: relatedId });
-    // }
-  }
-
-  /**
-   * Get cascade relations for a specific entity metadata (used for nested cascades)
-   */
-  private getCascadeRelationsForEntity(metadata: any): any[] {
-    const cascadeRelations: any[] = [];
-
-    metadata.oneToManyRelations.forEach((relation: any) => {
-      if (relation.onDelete === 'CASCADE') {
-        cascadeRelations.push({
-          type: 'OneToMany',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          joinColumn:
-            relation.inverseRelation?.joinColumns?.[0]?.propertyName || 'id',
-          foreignKey:
-            relation.inverseRelation?.joinColumns?.[0]?.referencedColumn
-              ?.propertyName || relation.propertyName,
-        });
-      }
-    });
-
-    metadata.oneToOneRelations.forEach((relation: any) => {
-      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
-        cascadeRelations.push({
-          type: 'OneToOne',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          joinColumn: relation.joinColumns?.[0]?.propertyName || 'id',
-          foreignKey:
-            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
-        });
-      }
-    });
-
-    metadata.manyToManyRelations.forEach((relation: any) => {
-      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
-        cascadeRelations.push({
-          type: 'ManyToMany',
-          relation,
-          targetEntity: relation.inverseEntityMetadata.target,
-          junctionTable: relation.junctionEntityMetadata?.tableName,
-          ownerColumn:
-            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
-          inverseColumn:
-            relation.inverseJoinColumns?.[0]?.referencedColumn?.propertyName ||
-            'id',
-        });
-      }
-    });
-
-    return cascadeRelations;
-  }
-
   async restoreSoftDeleted(
     id: string | FindOptionsWhere<Entity>,
   ): Promise<Model | undefined> {
@@ -916,15 +539,18 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
     }, 'restoreSoftDeleted');
   }
 
-  async queryBuilder(alias: string): Promise<SelectQueryBuilder<Entity>> {
-    /* eslint-disable-next-line @typescript-eslint/require-await */
-    return this.execute(async () => {
+  queryBuilder(alias: string): SelectQueryBuilder<Entity> {
+    try {
       return this.collection.createQueryBuilder(alias);
-    }, 'queryBuilder');
+    } catch (error) {
+      this.logger.warn(`Error creating query builder: ${error.message}`);
+
+      throw error;
+    }
   }
 
   // =============================================================================
-  // BULK OPERATIONS - UPSERT FUNCTIONALITY
+  // BULK OPERATIONS
   // =============================================================================
   async batchUpsert(
     dataArray: Array<{
@@ -950,30 +576,7 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
             const sampleData = chunk[0].id
               ? { ...chunk[0].data, id: chunk[0].id }
               : chunk[0].data;
-            const propertyNames = Object.keys(sampleData).sort();
-            const metadata = this.collection.metadata;
-
-            const columnMappings: {
-              propertyName: string;
-              columnName: string;
-            }[] = [];
-
-            propertyNames.forEach((propertyName) => {
-              const column = metadata.findColumnWithPropertyName(propertyName);
-              if (column) {
-                columnMappings.push({
-                  propertyName,
-                  columnName: column.databaseName,
-                });
-              } else {
-                columnMappings.push({
-                  propertyName,
-                  columnName: propertyName,
-                });
-              }
-            });
-
-            const columns = columnMappings.map((mapping) => mapping.columnName);
+            const columns = Object.keys(sampleData);
 
             const valuesClauses: string[] = [];
             const allValues: any[] = [];
@@ -995,10 +598,10 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
             });
 
             let query = `
-          INSERT INTO ${tableName} (${columns.join(', ')})
-          VALUES ${valuesClauses.join(', ')}
-          ON CONFLICT (${conflictColumns.join(', ')})
-        `;
+            INSERT INTO ${tableName} (${columns.map((c) => `"${c}"`).join(', ')})
+            VALUES ${valuesClauses.join(', ')}
+            ON CONFLICT (${conflictColumns.map((c) => `"${c}"`).join(', ')})
+          `;
 
             if (updateOnConflict) {
               const updateColumns = columns
@@ -1006,9 +609,10 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
                   (col) =>
                     !conflictColumns.includes(col) && col !== 'createdAt',
                 )
-                .map((col) => `${col} = EXCLUDED.${col}`)
+                .map((col) => `"${col}" = EXCLUDED."${col}"`)
                 .join(', ');
-              query += ` DO UPDATE SET ${updateColumns}, updated_at = NOW()`;
+
+              query += ` DO UPDATE SET ${updateColumns}${this.getUpdatedAtClause()}`;
             } else {
               query += ' DO NOTHING';
             }
@@ -1018,7 +622,7 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
             const batchResult = await manager.query(query, allValues);
             return batchResult
               .map((entity: Entity) => this.toModel(entity))
-              .filter((model): model is Model => model !== undefined);
+              .filter((model): model is Model => model !== null);
           },
         );
 
@@ -1028,10 +632,6 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
       return results;
     }, 'batchUpsert');
   }
-
-  // =============================================================================
-  // BULK OPERATIONS - HIGH PERFORMANCE BULK CRUD
-  // =============================================================================
 
   async bulkCreate({
     data,
@@ -1089,7 +689,7 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
 
             if (valuesToInsert.length === 0) continue;
 
-            const propertyNames = Object.keys(valuesToInsert[0]).sort();
+            const propertyNames = Object.keys(valuesToInsert[0]);
             const metadata = this.collection.metadata;
 
             const columnMappings: {
@@ -1118,22 +718,29 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
 
             valuesToInsert.forEach((row, rowIndex) => {
               const rowPlaceholders: string[] = [];
+
               columnMappings.forEach((mapping, colIndex) => {
                 const paramIndex =
                   rowIndex * columnMappings.length + colIndex + 1;
+
                 rowPlaceholders.push(`$${paramIndex}`);
                 values.push(row[mapping.propertyName]);
               });
+
               placeholders.push(`(${rowPlaceholders.join(', ')})`);
             });
 
             let query = `
-              INSERT INTO ${tableName} (${columns.join(', ')})
+              INSERT INTO ${tableName} (${columns
+                .map((c) => `"${c}"`)
+                .join(', ')})
               VALUES ${placeholders.join(', ')}
             `;
 
             if (conflictColumns.length > 0) {
-              query += ` ON CONFLICT (${conflictColumns.join(', ')}) DO NOTHING`;
+              query += ` ON CONFLICT (${conflictColumns
+                .map((c) => `"${c}"`)
+                .join(', ')}) DO NOTHING`;
             }
 
             if (!noModelReturn) {
@@ -1191,8 +798,75 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
           const tableName = this.collection.metadata.tableName;
 
           if (chunk.length > 1 && Object.keys(chunk[0].data).length > 0) {
-            const sampleData = chunk[0].data;
-            const propertyNames = Object.keys(sampleData).sort();
+            // Check if all items have the same properties
+            const firstItemKeys = Object.keys(chunk[0].data).sort();
+            const allHaveSameKeys = chunk.every((item) => {
+              const itemKeys = Object.keys(item.data).sort();
+              return (
+                itemKeys.length === firstItemKeys.length &&
+                itemKeys.every((key, idx) => key === firstItemKeys[idx])
+              );
+            });
+
+            // If not all items have same properties, process individually
+            if (!allHaveSameKeys) {
+              for (const updateItem of chunk) {
+                const propertyNames = Object.keys(updateItem.data).sort();
+                const metadata = this.collection.metadata;
+
+                const columnMappings: {
+                  propertyName: string;
+                  columnName: string;
+                }[] = [];
+
+                propertyNames.forEach((propertyName) => {
+                  const column =
+                    metadata.findColumnWithPropertyName(propertyName);
+                  if (column) {
+                    columnMappings.push({
+                      propertyName,
+                      columnName: column.databaseName,
+                    });
+                  } else {
+                    columnMappings.push({
+                      propertyName,
+                      columnName: propertyName,
+                    });
+                  }
+                });
+
+                const query = `
+                  UPDATE ${tableName}
+                  SET ${columnMappings
+                    .map(
+                      (mapping, idx) => `"${mapping.columnName}" = $${idx + 2}`,
+                    )
+                    .join(', ')}${this.getUpdatedAtClause()}
+                  WHERE id = $1
+                  ${!noModelReturn ? 'RETURNING *' : ''}
+                `;
+
+                const parameters = [
+                  updateItem.id,
+                  ...columnMappings.map(
+                    (mapping) => (updateItem.data as any)[mapping.propertyName],
+                  ),
+                ];
+
+                const updateResult = await manager.query(query, parameters);
+
+                if (!noModelReturn && updateResult.length > 0) {
+                  const model = this.toModel(updateResult[0] as Entity);
+                  if (model) {
+                    results.push(model);
+                  }
+                }
+              }
+              continue;
+            }
+
+            // All items have same properties - use batch update
+            const propertyNames = firstItemKeys;
             const metadata = this.collection.metadata;
 
             const columnMappings: {
@@ -1239,14 +913,21 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
 
             const caseStatements = updateColumns.map((column, columnIdx) => {
               const cases = chunk.map((item, itemIdx) => {
+                // Parameters are organized as: [ids array, ...ids for WHEN, ...values by column then by item]
+                // So for each column, we skip: 1 (ids array) + chunk.length (ids) + (columnIdx * chunk.length) + itemIdx
                 const paramIdx =
-                  2 + chunk.length + itemIdx * updateColumns.length + columnIdx;
+                  2 + chunk.length + columnIdx * chunk.length + itemIdx;
                 return `WHEN id = $${itemIdx + 2} THEN $${paramIdx}`;
               });
-              return `${column} = CASE ${cases.join(' ')} ELSE ${column} END`;
+              return `"${column}" = CASE ${cases.join(
+                ' ',
+              )} ELSE "${column}" END`;
             });
 
-            caseStatements.push('updated_at = NOW()');
+            const updatedAtColumn = this.getUpdatedAtColumnName();
+            if (updatedAtColumn) {
+              caseStatements.push(`${updatedAtColumn} = NOW()`);
+            }
 
             const query = `
               UPDATE ${tableName}
@@ -1256,9 +937,12 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
             `;
 
             const parameters: any[] = [ids];
+            // Add IDs first (for the WHEN clauses)
             chunk.forEach((item) => parameters.push(item.id));
-            chunk.forEach((item) => {
-              columnMappings.forEach((mapping) => {
+            // Add values in the same order as the CASE statements: by column, then by item
+            // All items are guaranteed to have the same properties at this point
+            columnMappings.forEach((mapping) => {
+              chunk.forEach((item) => {
                 parameters.push((item.data as any)[mapping.propertyName]);
               });
             });
@@ -1302,8 +986,10 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
               const query = `
                 UPDATE ${tableName}
                 SET ${columnMappings
-                  .map((mapping, idx) => `${mapping.columnName} = $${idx + 2}`)
-                  .join(', ')}, updated_at = NOW()
+                  .map(
+                    (mapping, idx) => `"${mapping.columnName}" = $${idx + 2}`,
+                  )
+                  .join(', ')}${this.getUpdatedAtClause()}
                 WHERE id = $1
                 ${!noModelReturn ? 'RETURNING *' : ''}
               `;
@@ -1386,12 +1072,12 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
         const setClause = columnMappings
           .map(
             (mapping, idx) =>
-              `${mapping.columnName} = $${idx + whereParams.length + 1}`,
+              `"${mapping.columnName}" = $${idx + whereParams.length + 1}`,
           )
           .join(', ');
 
-        // Add updated_at
-        const fullSetClause = `${setClause}, updated_at = NOW()`;
+        // Add updatedAt dynamically
+        const fullSetClause = `${setClause}${this.getUpdatedAtClause()}`;
 
         // Build the complete query
         const query = `
@@ -1442,20 +1128,13 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
       if (ids.length === 0) return;
 
       const executeOperation = async (manager: EntityManager) => {
-        const tableName = this.collection.metadata.tableName;
-
         for (let i = 0; i < ids.length; i += chunkSize) {
           const chunk = ids.slice(i, i + chunkSize);
 
           if (soft) {
-            await manager.query(
-              `UPDATE ${tableName} SET deleted_at = NOW() WHERE id = ANY($1) AND deleted_at IS NULL`,
-              [chunk],
-            );
+            await this.bulkSoftDeleteWithCascade(manager, chunk);
           } else {
-            await manager.query(`DELETE FROM ${tableName} WHERE id = ANY($1)`, [
-              chunk,
-            ]);
+            await this.bulkHardDeleteWithCascade(manager, chunk);
           }
         }
       };
@@ -1468,237 +1147,531 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
     }, 'bulkDelete');
   }
 
-  // =============================================================================
-  // Protected functions
-  // =============================================================================
-  protected get dataSource(): DataSource {
-    return this.collection.manager.connection;
-  }
+  async bulkDeleteWhere({
+    where,
+    options = { soft: true, chunkSize: 1000, useTransaction: true },
+  }: {
+    where: FindOptionsWhere<Entity> | FindOptionsWhere<Entity>[];
+    options?: IBulkOperationOptions & { soft?: boolean };
+  }): Promise<void> {
+    return this.execute(async () => {
+      const { soft = true, chunkSize = 1000, useTransaction = true } = options;
 
-  // Transformation/mapping function
-  // Specific repositories can override this if needed.
-  protected toModel(entity: Entity | null): Model | undefined {
-    return entity as unknown as Model;
-  }
+      const executeOperation = async (manager: EntityManager) => {
+        // First, fetch all IDs that match the where condition
+        const entities = await manager.find(this.collection.target, {
+          where,
+          select: ['id'] as any,
+          withDeleted: false,
+        });
 
-  /**
-   * Builds a WHERE clause from FindOptionsWhere object
-   * Supports basic equality conditions and arrays of conditions (OR)
-   */
-  protected buildWhereClause(
-    where: FindOptionsWhere<Entity> | FindOptionsWhere<Entity>[],
-  ): string {
-    if (Array.isArray(where)) {
-      // Handle array of conditions (OR)
-      const conditions = where.map(
-        (condition, index) =>
-          this.buildSingleWhereClause(condition, index * 100), // Offset for parameter numbering
-      );
-      return `(${conditions.join(' OR ')})`;
-    } else {
-      return this.buildSingleWhereClause(where, 0);
-    }
-  }
+        if (entities.length === 0) return;
 
-  /**
-   * Builds WHERE clause for a single condition object
-   */
-  private buildSingleWhereClause(
-    where: FindOptionsWhere<Entity>,
-    paramOffset: number,
-  ): string {
-    const conditions: string[] = [];
-    let paramIndex = paramOffset;
+        const ids = entities.map((entity: any) => entity.id);
 
-    for (const [key, value] of Object.entries(where)) {
-      const column = this.collection.metadata.findColumnWithPropertyName(key);
-      const columnName = column ? column.databaseName : key;
+        // Process in chunks
+        for (let i = 0; i < ids.length; i += chunkSize) {
+          const chunk = ids.slice(i, i + chunkSize);
 
-      if (value === null) {
-        conditions.push(`${columnName} IS NULL`);
-      } else if (Array.isArray(value)) {
-        // Handle IN clause
-        const placeholders = value.map(() => `$${++paramIndex}`).join(', ');
-        conditions.push(`${columnName} IN (${placeholders})`);
-      } else if (typeof value === 'object' && value !== null) {
-        // Handle operators like Not, LessThan, etc.
-        const operatorConditions = this.buildOperatorConditions(
-          columnName,
-          value,
-          paramIndex,
-        );
-        conditions.push(...operatorConditions.conditions);
-        paramIndex = operatorConditions.newParamIndex;
-      } else {
-        // Simple equality
-        conditions.push(`${columnName} = $${++paramIndex}`);
-      }
-    }
-
-    return conditions.join(' AND ');
-  }
-
-  /**
-   * Builds conditions for TypeORM operators
-   */
-  private buildOperatorConditions(
-    columnName: string,
-    value: any,
-    paramIndex: number,
-  ): { conditions: string[]; newParamIndex: number } {
-    const conditions: string[] = [];
-    let currentParamIndex = paramIndex;
-
-    if ('$ne' in value || 'Not' in value) {
-      conditions.push(`${columnName} != $${++currentParamIndex}`);
-    }
-
-    if ('$lt' in value || 'LessThan' in value) {
-      conditions.push(`${columnName} < $${++currentParamIndex}`);
-    }
-
-    if ('$lte' in value || 'LessThanOrEqual' in value) {
-      conditions.push(`${columnName} <= $${++currentParamIndex}`);
-    }
-
-    if ('$gt' in value || 'MoreThan' in value) {
-      conditions.push(`${columnName} > $${++currentParamIndex}`);
-    }
-
-    if ('$gte' in value || 'MoreThanOrEqual' in value) {
-      conditions.push(`${columnName} >= $${++currentParamIndex}`);
-    }
-
-    // Check if value is a TypeORM FindOperator for IN
-    if (
-      value &&
-      typeof value === 'object' &&
-      '_type' in value &&
-      value._type === 'in'
-    ) {
-      const _val = value._value;
-      const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
-      conditions.push(`${columnName} IN (${placeholders})`);
-    }
-
-    if ('$in' in value || 'In' in value) {
-      const _val = value.$in || value.In;
-      const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
-      conditions.push(`${columnName} IN (${placeholders})`);
-    }
-
-    if ('$nin' in value || 'NotIn' in value) {
-      const _val = value.$nin || value.NotIn;
-      const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
-      conditions.push(`${columnName} NOT IN (${placeholders})`);
-    }
-
-    if ('$like' in value || 'Like' in value) {
-      conditions.push(`${columnName} LIKE $${++currentParamIndex}`);
-    }
-
-    if ('$ilike' in value || 'ILike' in value) {
-      conditions.push(`${columnName} ILIKE $${++currentParamIndex}`);
-    }
-
-    return { conditions, newParamIndex: currentParamIndex };
-  }
-
-  /**
-   * Extracts parameters from FindOptionsWhere object
-   */
-  protected extractWhereParameters(
-    where: FindOptionsWhere<Entity> | FindOptionsWhere<Entity>[],
-  ): any[] {
-    const params: any[] = [];
-
-    if (Array.isArray(where)) {
-      where.forEach((condition) => {
-        params.push(...this.extractSingleWhereParameters(condition));
-      });
-    } else {
-      params.push(...this.extractSingleWhereParameters(where));
-    }
-
-    return params;
-  }
-
-  /**
-   * Extracts parameters from a single condition object
-   */
-  private extractSingleWhereParameters(where: FindOptionsWhere<Entity>): any[] {
-    const params: any[] = [];
-
-    Object.values(where).forEach((value) => {
-      if (value === null) {
-        // IS NULL doesn't need parameters
-        return;
-      } else if (Array.isArray(value)) {
-        // Handle IN clause
-        params.push(...value);
-      } else if (typeof value === 'object' && value !== null) {
-        // Handle operators
-        params.push(...this.extractOperatorParameters(value));
-      } else {
-        // Simple equality
-        params.push(value);
-      }
-    });
-
-    return params;
-  }
-
-  /**
-   * Extracts parameters from operator objects
-   */
-  private extractOperatorParameters(value: any): any[] {
-    const params: any[] = [];
-
-    // Check if value is a TypeORM FindOperator
-    if (value && typeof value === 'object' && '_type' in value) {
-      if (value._type === 'in' && Array.isArray(value._value)) {
-        params.push(...value._value);
-      }
-      // Add other operator types as needed
-      return params;
-    }
-
-    // Check all possible operators
-    const operators = [
-      '$ne',
-      'Not',
-      '$lt',
-      'LessThan',
-      '$lte',
-      'LessThanOrEqual',
-      '$gt',
-      'MoreThan',
-      '$gte',
-      'MoreThanOrEqual',
-      '$in',
-      'In',
-      '$nin',
-      'NotIn',
-      '$like',
-      'Like',
-      '$ilike',
-      'ILike',
-    ];
-
-    operators.forEach((op) => {
-      if (op in value) {
-        const val = value[op];
-        if (Array.isArray(val)) {
-          params.push(...val);
-        } else {
-          params.push(val);
+          if (soft) {
+            await this.bulkSoftDeleteWithCascade(manager, chunk);
+          } else {
+            await this.bulkHardDeleteWithCascade(manager, chunk);
+          }
         }
-      }
-    });
+      };
 
-    return params;
+      if (useTransaction) {
+        await this.dataSource.transaction(executeOperation);
+      } else {
+        await executeOperation(this.collection.manager);
+      }
+    }, 'bulkDeleteWhere');
   }
 
+  // =============================================================================
+  // Bulk Delete with Cascade (Performance-optimized)
+  // =============================================================================
+
+  /**
+   * Bulk soft delete with cascade in batch mode
+   * Applies SET NULL and CASCADE relations efficiently
+   */
+  private async bulkSoftDeleteWithCascade(
+    manager: EntityManager,
+    ids: string[],
+  ): Promise<void> {
+    const tableName = this.collection.metadata.tableName;
+    const deletedAtColumn = this.getDeletedAtColumnName();
+
+    if (!deletedAtColumn) {
+      this.logger.warn(
+        `Soft delete requested but ${tableName} does not have a deletedAt column. Skipping soft delete.`,
+      );
+      return;
+    }
+
+    // Step 1: Get all SET NULL relationships
+    const setNullRelations = this.getSetNullRelations();
+
+    // Step 2: Apply SET NULL in batch for all relations
+    for (const setNullRelation of setNullRelations) {
+      await this.bulkHandleSetNullRelation(manager, ids, setNullRelation);
+    }
+
+    // Step 3: Get all CASCADE relationships
+    const cascadeRelations = this.getCascadeRelations();
+
+    // Step 4: Apply CASCADE soft delete in batch for each relation type
+    for (const cascadeRelation of cascadeRelations) {
+      await this.bulkSoftDeleteCascadeRelation(manager, ids, cascadeRelation);
+    }
+
+    // Step 5: Finally, bulk soft delete the main entities
+    await manager.query(
+      `UPDATE ${tableName} 
+       SET ${deletedAtColumn} = NOW() 
+       WHERE id = ANY($1) AND ${deletedAtColumn} IS NULL`,
+      [ids],
+    );
+
+    this.logger.debug(
+      `Bulk soft deleted ${ids.length} ${tableName} records with cascade`,
+    );
+  }
+
+  /**
+   * Bulk hard delete with cascade in batch mode
+   * Applies SET NULL and CASCADE relations efficiently
+   */
+  private async bulkHardDeleteWithCascade(
+    manager: EntityManager,
+    ids: string[],
+  ): Promise<void> {
+    const tableName = this.collection.metadata.tableName;
+
+    // Step 1: Get all SET NULL relationships
+    const setNullRelations = this.getSetNullRelations();
+
+    // Step 2: Apply SET NULL in batch for all relations
+    for (const setNullRelation of setNullRelations) {
+      await this.bulkHandleSetNullRelation(manager, ids, setNullRelation);
+    }
+
+    // Step 3: Get all CASCADE relationships
+    const cascadeRelations = this.getCascadeRelations();
+
+    // Step 4: Apply CASCADE hard delete in batch for each relation type
+    for (const cascadeRelation of cascadeRelations) {
+      await this.bulkHardDeleteCascadeRelation(manager, ids, cascadeRelation);
+    }
+
+    // Step 5: Finally, bulk hard delete the main entities
+    await manager.query(`DELETE FROM ${tableName} WHERE id = ANY($1)`, [ids]);
+
+    this.logger.debug(
+      `Bulk hard deleted ${ids.length} ${tableName} records with cascade`,
+    );
+  }
+
+  /**
+   * Handle SET NULL relations in batch
+   * Updates all foreign keys to null for entities referencing the deleted ones
+   */
+  private async bulkHandleSetNullRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    setNullRelation: any,
+  ): Promise<void> {
+    const { targetEntity, foreignKey } = setNullRelation;
+    const targetRepo = manager.getRepository(targetEntity);
+    const targetMetadata = targetRepo.metadata;
+    const targetTableName = targetMetadata.tableName;
+
+    // Find the column metadata for the foreign key
+    const column = targetMetadata.findColumnWithPropertyName(foreignKey);
+    const columnName = column ? column.databaseName : foreignKey;
+
+    // Bulk update all entities that reference any of the parent IDs
+    const updateResult = await manager.query(
+      `UPDATE ${targetTableName} 
+       SET "${columnName}" = NULL 
+       WHERE "${columnName}" = ANY($1)`,
+      [parentIds],
+    );
+
+    if (updateResult.affectedRows > 0 || updateResult[1] > 0) {
+      const affectedCount = updateResult.affectedRows || updateResult[1] || 0;
+      this.logger.debug(
+        `Bulk updated foreign key ${foreignKey} to null in ${affectedCount} ${targetEntity.name} records`,
+      );
+    }
+  }
+
+  /**
+   * Bulk soft delete CASCADE relations
+   * Recursively soft deletes related entities in batch
+   */
+  private async bulkSoftDeleteCascadeRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    cascadeRelation: any,
+  ): Promise<void> {
+    const { type } = cascadeRelation;
+
+    switch (type) {
+      case 'OneToMany':
+        await this.bulkSoftDeleteOneToManyRelation(
+          manager,
+          parentIds,
+          cascadeRelation,
+        );
+        break;
+      case 'OneToOne':
+        await this.bulkSoftDeleteOneToOneRelation(
+          manager,
+          parentIds,
+          cascadeRelation,
+        );
+        break;
+      case 'ManyToMany':
+        await this.bulkSoftDeleteManyToManyRelation(
+          manager,
+          parentIds,
+          cascadeRelation,
+        );
+        break;
+    }
+  }
+
+  /**
+   * Bulk hard delete CASCADE relations
+   * Recursively hard deletes related entities in batch
+   */
+  private async bulkHardDeleteCascadeRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    cascadeRelation: any,
+  ): Promise<void> {
+    const { type } = cascadeRelation;
+
+    switch (type) {
+      case 'OneToMany':
+        await this.bulkHardDeleteOneToManyRelation(
+          manager,
+          parentIds,
+          cascadeRelation,
+        );
+        break;
+      case 'OneToOne':
+        await this.bulkHardDeleteOneToOneRelation(
+          manager,
+          parentIds,
+          cascadeRelation,
+        );
+        break;
+      case 'ManyToMany':
+        await this.bulkHardDeleteManyToManyRelation(
+          manager,
+          parentIds,
+          cascadeRelation,
+        );
+        break;
+    }
+  }
+
+  /**
+   * Bulk soft delete OneToMany cascade relations
+   */
+  private async bulkSoftDeleteOneToManyRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    relationConfig: any,
+  ): Promise<void> {
+    const { targetEntity, foreignKey } = relationConfig;
+    const targetRepo = manager.getRepository(targetEntity);
+    const targetMetadata = targetRepo.metadata;
+    const targetTableName = targetMetadata.tableName;
+
+    // Find the column metadata for the foreign key
+    const column = targetMetadata.findColumnWithPropertyName(foreignKey);
+    const columnName = column ? column.databaseName : foreignKey;
+
+    // Get deletedAt column for the related entity
+    const deletedAtColumn = this.getDeletedAtColumnName(targetMetadata);
+
+    if (!deletedAtColumn) {
+      this.logger.warn(
+        `Related entity ${targetTableName} does not have deletedAt column. Skipping soft delete cascade.`,
+      );
+      return;
+    }
+
+    // Find all related entity IDs
+    const relatedEntitiesResult = await manager.query(
+      `SELECT id FROM ${targetTableName} 
+       WHERE "${columnName}" = ANY($1) AND ${deletedAtColumn} IS NULL`,
+      [parentIds],
+    );
+
+    if (relatedEntitiesResult.length === 0) return;
+
+    const relatedIds = relatedEntitiesResult.map((row: any) => row.id);
+
+    // Get nested cascades for related entities
+    const nestedCascades = this.getCascadeRelationsForEntity(targetMetadata);
+
+    // Recursively handle nested cascades
+    for (const nestedCascade of nestedCascades) {
+      await this.bulkSoftDeleteCascadeRelation(
+        manager,
+        relatedIds,
+        nestedCascade,
+      );
+    }
+
+    // Soft delete all related entities
+    await manager.query(
+      `UPDATE ${targetTableName} 
+       SET ${deletedAtColumn} = NOW() 
+       WHERE id = ANY($1) AND ${deletedAtColumn} IS NULL`,
+      [relatedIds],
+    );
+
+    this.logger.debug(
+      `Bulk soft deleted ${relatedIds.length} ${targetEntity.name} cascade records`,
+    );
+  }
+
+  /**
+   * Bulk hard delete OneToMany cascade relations
+   */
+  private async bulkHardDeleteOneToManyRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    relationConfig: any,
+  ): Promise<void> {
+    const { targetEntity, foreignKey } = relationConfig;
+    const targetRepo = manager.getRepository(targetEntity);
+    const targetMetadata = targetRepo.metadata;
+    const targetTableName = targetMetadata.tableName;
+
+    // Find the column metadata for the foreign key
+    const column = targetMetadata.findColumnWithPropertyName(foreignKey);
+    const columnName = column ? column.databaseName : foreignKey;
+
+    // Find all related entity IDs
+    const relatedEntitiesResult = await manager.query(
+      `SELECT id FROM ${targetTableName} WHERE "${columnName}" = ANY($1)`,
+      [parentIds],
+    );
+
+    if (relatedEntitiesResult.length === 0) return;
+
+    const relatedIds = relatedEntitiesResult.map((row: any) => row.id);
+
+    // Get nested cascades for related entities
+    const nestedCascades = this.getCascadeRelationsForEntity(targetMetadata);
+
+    // Recursively handle nested cascades
+    for (const nestedCascade of nestedCascades) {
+      await this.bulkHardDeleteCascadeRelation(
+        manager,
+        relatedIds,
+        nestedCascade,
+      );
+    }
+
+    // Hard delete all related entities
+    await manager.query(`DELETE FROM ${targetTableName} WHERE id = ANY($1)`, [
+      relatedIds,
+    ]);
+
+    this.logger.debug(
+      `Bulk hard deleted ${relatedIds.length} ${targetEntity.name} cascade records`,
+    );
+  }
+
+  /**
+   * Bulk soft delete OneToOne cascade relations
+   */
+  private async bulkSoftDeleteOneToOneRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    relationConfig: any,
+  ): Promise<void> {
+    const { targetEntity, joinColumn } = relationConfig;
+    const targetRepo = manager.getRepository(targetEntity);
+    const targetMetadata = targetRepo.metadata;
+    const targetTableName = targetMetadata.tableName;
+    const parentTableName = this.collection.metadata.tableName;
+
+    // Find the column metadata for the join column
+    const column =
+      this.collection.metadata.findColumnWithPropertyName(joinColumn);
+    const columnName = column ? column.databaseName : joinColumn;
+
+    // Get deletedAt column for the related entity
+    const deletedAtColumn = this.getDeletedAtColumnName(targetMetadata);
+
+    if (!deletedAtColumn) {
+      this.logger.warn(
+        `Related entity ${targetTableName} does not have deletedAt column. Skipping soft delete cascade.`,
+      );
+      return;
+    }
+
+    // Get foreign key values from parent entities
+    const foreignKeyValuesResult = await manager.query(
+      `SELECT "${columnName}" as fk_value 
+       FROM ${parentTableName} 
+       WHERE id = ANY($1) AND "${columnName}" IS NOT NULL`,
+      [parentIds],
+    );
+
+    if (foreignKeyValuesResult.length === 0) return;
+
+    const relatedIds = foreignKeyValuesResult
+      .map((row: any) => row.fk_value)
+      .filter((id: any) => id !== null);
+
+    if (relatedIds.length === 0) return;
+
+    // Get nested cascades for related entities
+    const nestedCascades = this.getCascadeRelationsForEntity(targetMetadata);
+
+    // Recursively handle nested cascades
+    for (const nestedCascade of nestedCascades) {
+      await this.bulkSoftDeleteCascadeRelation(
+        manager,
+        relatedIds,
+        nestedCascade,
+      );
+    }
+
+    // Soft delete related entities
+    await manager.query(
+      `UPDATE ${targetTableName} 
+       SET ${deletedAtColumn} = NOW() 
+       WHERE id = ANY($1) AND ${deletedAtColumn} IS NULL`,
+      [relatedIds],
+    );
+
+    this.logger.debug(
+      `Bulk soft deleted ${relatedIds.length} ${targetEntity.name} cascade records`,
+    );
+  }
+
+  /**
+   * Bulk hard delete OneToOne cascade relations
+   */
+  private async bulkHardDeleteOneToOneRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    relationConfig: any,
+  ): Promise<void> {
+    const { targetEntity, joinColumn } = relationConfig;
+    const targetRepo = manager.getRepository(targetEntity);
+    const targetMetadata = targetRepo.metadata;
+    const targetTableName = targetMetadata.tableName;
+    const parentTableName = this.collection.metadata.tableName;
+
+    // Find the column metadata for the join column
+    const column =
+      this.collection.metadata.findColumnWithPropertyName(joinColumn);
+    const columnName = column ? column.databaseName : joinColumn;
+
+    // Get foreign key values from parent entities
+    const foreignKeyValuesResult = await manager.query(
+      `SELECT "${columnName}" as fk_value 
+       FROM ${parentTableName} 
+       WHERE id = ANY($1) AND "${columnName}" IS NOT NULL`,
+      [parentIds],
+    );
+
+    if (foreignKeyValuesResult.length === 0) return;
+
+    const relatedIds = foreignKeyValuesResult
+      .map((row: any) => row.fk_value)
+      .filter((id: any) => id !== null);
+
+    if (relatedIds.length === 0) return;
+
+    // Get nested cascades for related entities
+    const nestedCascades = this.getCascadeRelationsForEntity(targetMetadata);
+
+    // Recursively handle nested cascades
+    for (const nestedCascade of nestedCascades) {
+      await this.bulkHardDeleteCascadeRelation(
+        manager,
+        relatedIds,
+        nestedCascade,
+      );
+    }
+
+    // Hard delete related entities
+    await manager.query(`DELETE FROM ${targetTableName} WHERE id = ANY($1)`, [
+      relatedIds,
+    ]);
+
+    this.logger.debug(
+      `Bulk hard deleted ${relatedIds.length} ${targetEntity.name} cascade records`,
+    );
+  }
+
+  /**
+   * Bulk soft delete ManyToMany cascade relations
+   */
+  private async bulkSoftDeleteManyToManyRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    relationConfig: any,
+  ): Promise<void> {
+    const { junctionTable, ownerColumn } = relationConfig;
+
+    if (!junctionTable) return;
+
+    // Find the column metadata for the owner column
+    const junctionMetadata = this.dataSource.entityMetadatas.find(
+      (meta) => meta.tableName === junctionTable,
+    );
+
+    let ownerColumnName = ownerColumn;
+    if (junctionMetadata) {
+      const column = junctionMetadata.findColumnWithPropertyName(ownerColumn);
+      ownerColumnName = column ? column.databaseName : ownerColumn;
+    }
+
+    // Remove junction table entries in batch
+    await manager.query(
+      `DELETE FROM ${junctionTable} WHERE "${ownerColumnName}" = ANY($1)`,
+      [parentIds],
+    );
+
+    this.logger.debug(
+      `Bulk deleted junction table entries from ${junctionTable} for ${parentIds.length} records`,
+    );
+  }
+
+  /**
+   * Bulk hard delete ManyToMany cascade relations
+   */
+  private async bulkHardDeleteManyToManyRelation(
+    manager: EntityManager,
+    parentIds: string[],
+    relationConfig: any,
+  ): Promise<void> {
+    // ManyToMany hard delete is the same as soft delete for junction tables
+    await this.bulkSoftDeleteManyToManyRelation(
+      manager,
+      parentIds,
+      relationConfig,
+    );
+  }
+
+  // =============================================================================
+  // Helper methods
+  // =============================================================================
   protected async execute<T>(
     operation: () => Promise<T>,
     operationName?: string,
@@ -1747,6 +1720,615 @@ export abstract class AbstractRepository<Entity extends ObjectLiteral, Model>
 
       throw error;
     }
+  }
+
+  protected get dataSource(): DataSource {
+    return this.collection.manager.connection;
+  }
+
+  // Transformation/mapping function
+  // Specific repositories can override this if needed.
+  protected toModel(entity: Entity | null): Model | undefined {
+    return entity as unknown as Model;
+  }
+
+  /**
+   * Get all relations that have onDelete: 'CASCADE' configured
+   */
+  private getCascadeRelations() {
+    const metadata = this.collection.metadata;
+    const cascadeRelations: any[] = [];
+
+    // Check OneToMany relations
+    metadata.oneToManyRelations.forEach((relation) => {
+      if (relation.onDelete === 'CASCADE') {
+        cascadeRelations.push({
+          type: 'OneToMany',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          joinColumn:
+            relation.inverseRelation?.joinColumns?.[0]?.propertyName || 'id',
+          foreignKey:
+            relation.inverseRelation?.joinColumns?.[0]?.referencedColumn
+              ?.propertyName || relation.propertyName,
+        });
+      }
+    });
+
+    // Check OneToOne relations where this entity is the owner
+    metadata.oneToOneRelations.forEach((relation) => {
+      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
+        cascadeRelations.push({
+          type: 'OneToOne',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          joinColumn: relation.joinColumns?.[0]?.propertyName || 'id',
+          foreignKey:
+            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
+        });
+      }
+    });
+
+    // Check ManyToMany relations where this entity owns the junction table
+    metadata.manyToManyRelations.forEach((relation) => {
+      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
+        cascadeRelations.push({
+          type: 'ManyToMany',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          junctionTable: relation.junctionEntityMetadata?.tableName,
+          ownerColumn:
+            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
+          inverseColumn:
+            relation.inverseJoinColumns?.[0]?.referencedColumn?.propertyName ||
+            'id',
+        });
+      }
+    });
+
+    return cascadeRelations;
+  }
+
+  /**
+   * Get all relations that have onDelete: 'SET NULL' configured
+   * This finds entities that reference THIS entity and should be set to null when this entity is deleted
+   */
+  private getSetNullRelations() {
+    const currentEntityTarget = this.collection.metadata.target;
+    const setNullRelations: any[] = [];
+
+    // Iterate over all entity metadatas to find relations that reference this entity with SET NULL
+    this.dataSource.entityMetadatas.forEach((entityMetadata) => {
+      // Check OneToOne relations in this entity that reference the current entity
+      entityMetadata.oneToOneRelations.forEach((relation) => {
+        if (
+          relation.onDelete === 'SET NULL' &&
+          relation.inverseEntityMetadata.target === currentEntityTarget
+        ) {
+          // This relation in the other entity references our entity with SET NULL
+          const foreignKeyColumn = relation.joinColumns?.[0]?.propertyName;
+          if (foreignKeyColumn) {
+            setNullRelations.push({
+              type: 'OneToOneSetNull',
+              relation,
+              targetEntity: entityMetadata.target,
+              foreignKey: foreignKeyColumn,
+            });
+          }
+        }
+      });
+
+      // Check OneToMany relations (though SET NULL on OneToMany is unusual, but possible)
+      entityMetadata.oneToManyRelations.forEach((relation) => {
+        if (
+          relation.onDelete === 'SET NULL' &&
+          relation.inverseEntityMetadata.target === currentEntityTarget
+        ) {
+          const foreignKeyProperty =
+            relation.inverseRelation?.joinColumns?.[0]?.propertyName;
+          if (foreignKeyProperty) {
+            setNullRelations.push({
+              type: 'OneToManySetNull',
+              relation,
+              targetEntity: entityMetadata.target,
+              foreignKey: foreignKeyProperty,
+            });
+          }
+        }
+      });
+    });
+
+    return setNullRelations;
+  }
+
+  /**
+   * Handle SET NULL relations by updating foreign key columns to null
+   * This finds entities that reference the entity being deleted and sets their foreign keys to null
+   */
+  private async handleSetNullRelation(
+    manager: EntityManager,
+    parentEntity: Entity,
+    setNullRelation: any,
+  ): Promise<void> {
+    const { targetEntity, foreignKey } = setNullRelation;
+    const parentId = (parentEntity as any).id;
+
+    // Update all entities that reference this entity by setting their foreign key to null
+    const updateResult = await manager.update(
+      targetEntity,
+      { [foreignKey]: parentId },
+      { [foreignKey]: null },
+    );
+
+    if (updateResult.affected && updateResult.affected > 0) {
+      this.logger.debug(
+        `Updated foreign key ${foreignKey} to null in ${updateResult.affected} ${targetEntity.name} records for deleted entity ${this.collection.metadata.tableName} with id ${parentId}`,
+      );
+    }
+  }
+
+  /**
+   * Recursively soft delete cascade relations
+   */
+  private async softDeleteCascadeRelation(
+    manager: EntityManager,
+    parentEntity: Entity,
+    relationConfig: any,
+  ): Promise<void> {
+    const { type } = relationConfig;
+
+    switch (type) {
+      case 'OneToMany':
+        await this.softDeleteOneToManyRelation(
+          manager,
+          parentEntity,
+          relationConfig,
+        );
+        break;
+      case 'OneToOne':
+        await this.softDeleteOneToOneRelation(
+          manager,
+          parentEntity,
+          relationConfig,
+        );
+        break;
+      case 'ManyToMany':
+        await this.softDeleteManyToManyRelation(
+          manager,
+          parentEntity,
+          relationConfig,
+        );
+        break;
+    }
+  }
+
+  /**
+   * Soft delete OneToMany cascade relations
+   */
+  private async softDeleteOneToManyRelation(
+    manager: EntityManager,
+    parentEntity: Entity,
+    relationConfig: any,
+  ): Promise<void> {
+    const { targetEntity, foreignKey } = relationConfig;
+    const parentId = (parentEntity as any).id;
+
+    // Find all related entities
+    const relatedEntities = await manager.find(targetEntity, {
+      where: { [foreignKey]: parentId } as any,
+    });
+
+    // Recursively soft delete each related entity (in case they have their own cascades)
+    for (const relatedEntity of relatedEntities) {
+      const relatedRepo = manager.getRepository(targetEntity);
+      const relatedMetadata = relatedRepo.metadata;
+
+      // Check if the related entity has its own cascade relations
+      const nestedCascades = this.getCascadeRelationsForEntity(relatedMetadata);
+
+      for (const nestedCascade of nestedCascades) {
+        await this.softDeleteCascadeRelation(
+          manager,
+          relatedEntity as Entity,
+          nestedCascade,
+        );
+      }
+
+      // Soft delete the related entity
+      await manager.softDelete(targetEntity, { id: (relatedEntity as any).id });
+    }
+  }
+
+  /**
+   * Soft delete OneToOne cascade relations
+   */
+  private async softDeleteOneToOneRelation(
+    manager: EntityManager,
+    parentEntity: Entity,
+    relationConfig: any,
+  ): Promise<void> {
+    const { targetEntity, joinColumn } = relationConfig;
+    const foreignKeyValue = (parentEntity as any)[joinColumn];
+
+    if (!foreignKeyValue) return;
+
+    const relatedEntity = await manager.findOne(targetEntity, {
+      where: { id: foreignKeyValue } as any,
+    });
+
+    if (relatedEntity) {
+      const relatedRepo = manager.getRepository(targetEntity);
+      const relatedMetadata = relatedRepo.metadata;
+
+      // Check if the related entity has its own cascade relations
+      const nestedCascades = this.getCascadeRelationsForEntity(relatedMetadata);
+
+      for (const nestedCascade of nestedCascades) {
+        await this.softDeleteCascadeRelation(
+          manager,
+          relatedEntity as Entity,
+          nestedCascade,
+        );
+      }
+
+      // Soft delete the related entity
+      await manager.softDelete(targetEntity, { id: (relatedEntity as any).id });
+    }
+  }
+
+  /**
+   * Handle ManyToMany cascade relations (removes junction table entries)
+   */
+  private async softDeleteManyToManyRelation(
+    manager: EntityManager,
+    parentEntity: Entity,
+    relationConfig: any,
+  ): Promise<void> {
+    const { junctionTable, ownerColumn } = relationConfig;
+    const parentId = (parentEntity as any).id;
+
+    if (!junctionTable) return;
+
+    // For ManyToMany, we typically just remove the junction table entries
+    // The related entities themselves are usually not deleted in cascade
+    // But if you need to soft delete them as well, you can implement that logic here
+
+    // Remove junction table entries
+    await manager.query(
+      `DELETE FROM ${junctionTable} WHERE "${ownerColumn}" = $1`,
+      [parentId],
+    );
+
+    // If you need to also soft delete the related entities:
+    // const relatedIds = await manager.query(
+    //   `SELECT "${relationConfig.inverseColumn}" FROM ${junctionTable} WHERE "${ownerColumn}" = $1`,
+    //   [parentId]
+    // );
+    //
+    // for (const { [relationConfig.inverseColumn]: relatedId } of relatedIds) {
+    //   await manager.softDelete(targetEntity, { id: relatedId });
+    // }
+  }
+
+  /**
+   * Get cascade relations for a specific entity metadata (used for nested cascades)
+   */
+  private getCascadeRelationsForEntity(metadata: any): any[] {
+    const cascadeRelations: any[] = [];
+
+    metadata.oneToManyRelations.forEach((relation: any) => {
+      if (relation.onDelete === 'CASCADE') {
+        cascadeRelations.push({
+          type: 'OneToMany',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          joinColumn:
+            relation.inverseRelation?.joinColumns?.[0]?.propertyName || 'id',
+          foreignKey:
+            relation.inverseRelation?.joinColumns?.[0]?.referencedColumn
+              ?.propertyName || relation.propertyName,
+        });
+      }
+    });
+
+    metadata.oneToOneRelations.forEach((relation: any) => {
+      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
+        cascadeRelations.push({
+          type: 'OneToOne',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          joinColumn: relation.joinColumns?.[0]?.propertyName || 'id',
+          foreignKey:
+            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
+        });
+      }
+    });
+
+    metadata.manyToManyRelations.forEach((relation: any) => {
+      if (relation.onDelete === 'CASCADE' && relation.isOwning) {
+        cascadeRelations.push({
+          type: 'ManyToMany',
+          relation,
+          targetEntity: relation.inverseEntityMetadata.target,
+          junctionTable: relation.junctionEntityMetadata?.tableName,
+          ownerColumn:
+            relation.joinColumns?.[0]?.referencedColumn?.propertyName || 'id',
+          inverseColumn:
+            relation.inverseJoinColumns?.[0]?.referencedColumn?.propertyName ||
+            'id',
+        });
+      }
+    });
+
+    return cascadeRelations;
+  }
+
+  /**
+   * Gets the actual database column name for updatedAt field
+   * Checks if the column exists and returns the correct name (camelCase or snake_case)
+   * @param metadata Optional entity metadata. If not provided, uses this.collection.metadata
+   */
+  private getUpdatedAtColumnName(metadata?: any): string | null {
+    const entityMetadata = metadata || this.collection.metadata;
+
+    // Try to find updatedAt column (camelCase)
+    const camelCaseColumn = entityMetadata.columns.find(
+      (col: any) =>
+        col.propertyName === 'updatedAt' || col.databaseName === 'updatedAt',
+    );
+
+    if (camelCaseColumn) {
+      return `"${camelCaseColumn.databaseName}"`;
+    }
+
+    // Try to find updated_at column (snake_case)
+    const snakeCaseColumn = entityMetadata.columns.find(
+      (col: any) =>
+        col.propertyName === 'updatedAt' || col.databaseName === 'updated_at',
+    );
+
+    if (snakeCaseColumn) {
+      return `"${snakeCaseColumn.databaseName}"`;
+    }
+
+    return null;
+  }
+
+  /**
+   * Gets the actual database column name for deletedAt field
+   * Checks if the column exists and returns the correct name (camelCase or snake_case)
+   * @param metadata Optional entity metadata. If not provided, uses this.collection.metadata
+   */
+  private getDeletedAtColumnName(metadata?: any): string | null {
+    const entityMetadata = metadata || this.collection.metadata;
+
+    // Try to find deletedAt column (camelCase)
+    const camelCaseColumn = entityMetadata.columns.find(
+      (col: any) =>
+        col.propertyName === 'deletedAt' || col.databaseName === 'deletedAt',
+    );
+
+    if (camelCaseColumn) {
+      return `"${camelCaseColumn.databaseName}"`;
+    }
+
+    // Try to find deleted_at column (snake_case)
+    const snakeCaseColumn = entityMetadata.columns.find(
+      (col: any) =>
+        col.propertyName === 'deletedAt' || col.databaseName === 'deleted_at',
+    );
+
+    if (snakeCaseColumn) {
+      return `"${snakeCaseColumn.databaseName}"`;
+    }
+
+    return null;
+  }
+
+  /**
+   * Gets the UPDATE clause for setting updatedAt to current timestamp
+   * Returns empty string if column doesn't exist
+   */
+  private getUpdatedAtClause(): string {
+    const columnName = this.getUpdatedAtColumnName();
+    return columnName ? `, ${columnName} = NOW()` : '';
+  }
+
+  /**
+   * Builds a WHERE clause from FindOptionsWhere object
+   * Supports basic equality conditions and arrays of conditions (OR)
+   */
+  private buildWhereClause(
+    where: FindOptionsWhere<Entity> | FindOptionsWhere<Entity>[],
+  ): string {
+    if (Array.isArray(where)) {
+      // Handle array of conditions (OR)
+      const conditions = where.map(
+        (condition, index) =>
+          this.buildSingleWhereClause(condition, index * 100), // Offset for parameter numbering
+      );
+      return `(${conditions.join(' OR ')})`;
+    }
+    return this.buildSingleWhereClause(where, 0);
+  }
+
+  /**
+   * Builds WHERE clause for a single condition object
+   */
+  private buildSingleWhereClause(
+    where: FindOptionsWhere<Entity>,
+    paramOffset: number,
+  ): string {
+    const conditions: string[] = [];
+    let paramIndex = paramOffset;
+
+    for (const [key, value] of Object.entries(where)) {
+      const column = this.collection.metadata.findColumnWithPropertyName(key);
+      const columnName = column ? column.databaseName : key;
+      const quotedColumnName = `"${columnName}"`;
+
+      if (value === null) {
+        conditions.push(`${quotedColumnName} IS NULL`);
+      } else if (Array.isArray(value)) {
+        // Handle IN clause
+        const placeholders = value.map(() => `$${++paramIndex}`).join(', ');
+        conditions.push(`${quotedColumnName} IN (${placeholders})`);
+      } else if (typeof value === 'object' && value !== null) {
+        // Handle operators like Not, LessThan, etc.
+        const operatorConditions = this.buildOperatorConditions(
+          quotedColumnName,
+          value,
+          paramIndex,
+        );
+        conditions.push(...operatorConditions.conditions);
+        paramIndex = operatorConditions.newParamIndex;
+      } else {
+        // Simple equality
+        conditions.push(`${quotedColumnName} = $${++paramIndex}`);
+      }
+    }
+
+    return conditions.join(' AND ');
+  }
+
+  /**
+   * Builds conditions for TypeORM operators
+   * Note: columnName parameter should already include proper quoting
+   */
+  private buildOperatorConditions(
+    columnName: string,
+    value: any,
+    paramIndex: number,
+  ): { conditions: string[]; newParamIndex: number } {
+    const conditions: string[] = [];
+    let currentParamIndex = paramIndex;
+
+    if ('$ne' in value || 'Not' in value) {
+      conditions.push(`${columnName} != $${++currentParamIndex}`);
+    }
+
+    if ('$lt' in value || 'LessThan' in value) {
+      conditions.push(`${columnName} < $${++currentParamIndex}`);
+    }
+
+    if ('$lte' in value || 'LessThanOrEqual' in value) {
+      conditions.push(`${columnName} <= $${++currentParamIndex}`);
+    }
+
+    if ('$gt' in value || 'MoreThan' in value) {
+      conditions.push(`${columnName} > $${++currentParamIndex}`);
+    }
+
+    if ('$gte' in value || 'MoreThanOrEqual' in value) {
+      conditions.push(`${columnName} >= $${++currentParamIndex}`);
+    }
+
+    if ('$in' in value || 'In' in value) {
+      const _val = value.$in || value.In;
+      const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
+      conditions.push(`${columnName} IN (${placeholders})`);
+    }
+
+    if ('$nin' in value || 'NotIn' in value) {
+      const _val = value.$nin || value.NotIn;
+      const placeholders = _val.map(() => `$${++currentParamIndex}`).join(', ');
+      conditions.push(`${columnName} NOT IN (${placeholders})`);
+    }
+
+    if ('$like' in value || 'Like' in value) {
+      conditions.push(`${columnName} LIKE $${++currentParamIndex}`);
+    }
+
+    if ('$ilike' in value || 'ILike' in value) {
+      conditions.push(`${columnName} ILIKE $${++currentParamIndex}`);
+    }
+
+    return { conditions, newParamIndex: currentParamIndex };
+  }
+
+  /**
+   * Extracts parameters from FindOptionsWhere object
+   */
+  private extractWhereParameters(
+    where: FindOptionsWhere<Entity> | FindOptionsWhere<Entity>[],
+  ): any[] {
+    const params: any[] = [];
+
+    if (Array.isArray(where)) {
+      where.forEach((condition) => {
+        params.push(...this.extractSingleWhereParameters(condition));
+      });
+    } else {
+      params.push(...this.extractSingleWhereParameters(where));
+    }
+
+    return params;
+  }
+
+  /**
+   * Extracts parameters from a single condition object
+   */
+  private extractSingleWhereParameters(where: FindOptionsWhere<Entity>): any[] {
+    const params: any[] = [];
+
+    Object.values(where).forEach((value) => {
+      if (value === null) {
+        // IS NULL doesn't need parameters
+      } else if (Array.isArray(value)) {
+        // Handle IN clause
+        params.push(...value);
+      } else if (typeof value === 'object' && value !== null) {
+        // Handle operators
+        params.push(...this.extractOperatorParameters(value));
+      } else {
+        // Simple equality
+        params.push(value);
+      }
+    });
+
+    return params;
+  }
+
+  /**
+   * Extracts parameters from operator objects
+   */
+  private extractOperatorParameters(value: any): any[] {
+    const params: any[] = [];
+
+    // Check all possible operators
+    const operators = [
+      '$ne',
+      'Not',
+      '$lt',
+      'LessThan',
+      '$lte',
+      'LessThanOrEqual',
+      '$gt',
+      'MoreThan',
+      '$gte',
+      'MoreThanOrEqual',
+      '$in',
+      'In',
+      '$nin',
+      'NotIn',
+      '$like',
+      'Like',
+      '$ilike',
+      'ILike',
+    ];
+
+    operators.forEach((op) => {
+      if (op in value) {
+        const val = value[op];
+        if (Array.isArray(val)) {
+          params.push(...val);
+        } else {
+          params.push(val);
+        }
+      }
+    });
+
+    return params;
   }
 
   /**
